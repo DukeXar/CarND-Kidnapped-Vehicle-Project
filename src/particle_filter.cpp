@@ -97,7 +97,7 @@ void ParticleFilter::prediction(double delta_t, double std_pos[],
 
     particle.x = x_new + x_noise;
     particle.y = y_new + y_noise;
-    particle.theta = std::fmod(theta_new + theta_noise, 2 * M_PI);
+    particle.theta = theta_new + theta_noise;
   }
 }
 
