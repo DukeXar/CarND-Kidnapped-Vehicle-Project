@@ -20,7 +20,7 @@ namespace {
 template <typename T>
 std::string VecToS(const std::vector<T>& v) {
   std::ostringstream oss;
-  bool delim = "";
+  const char* delim = "";
   for (const auto& i : v) {
     oss << delim << i;
     delim = " ";
@@ -33,14 +33,9 @@ struct Point {
   double y;
 };
 
-Point ConvertGlobalToLocal(Point map_pt, Point p_pt, double p_theta) {
-  // Translate from global to local
-  double tx = map_pt.x - p_pt.x;
-  double ty = map_pt.y - p_pt.y;
-
-  // Then rotate CCW
-  double x = tx * cos(p_theta) - ty * sin(p_theta);
-  double y = tx * sin(p_theta) + ty * cos(p_theta);
+Point LocalToGlobal(Point map_pt, Particle p) {
+  double x = map_pt.x * cos(p.theta) - map_pt.y * sin(p.theta) + p.x;
+  double y = map_pt.x * sin(p.theta) + map_pt.y * cos(p.theta) + p.y;
   return Point{x, y};
 }
 
@@ -53,19 +48,20 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
   // Add random Gaussian noise to each particle.
   // NOTE: Consult particle_filter.h for more information about this method (and
   // others in this file).
+
+  const size_t kTotalParticles = 100;
+
   std::default_random_engine gen;
   std::normal_distribution<double> x_dist(x, std[0]), y_dist(y, std[1]),
       theta_dist(theta, std[2]);
 
-  for (int i = 0; i < num_particles; ++i) {
-    double sx = x_dist(gen);
-    double sy = y_dist(gen);
-    double stheta = theta_dist(gen);
+  for (int i = 0; i < kTotalParticles; ++i) {
+    const double sx = x_dist(gen);
+    const double sy = y_dist(gen);
+    const double stheta = theta_dist(gen);
 
     particles.push_back(Particle{i, sx, sy, stheta, 1.0, {}, {}, {}});
   }
-
-  weights.assign(num_particles, 1.0);
 
   is_initialized = true;
 }
@@ -83,14 +79,21 @@ void ParticleFilter::prediction(double delta_t, double std_pos[],
       theta_dist(0, std_pos[2]);
 
   for (auto& particle : particles) {
-    double theta_new = particle.theta + delta_t * yaw_rate;
-    double k = velocity / yaw_rate;
-    double x_new = particle.x + k * (sin(theta_new) - sin(particle.theta));
-    double y_new = particle.y + k * (cos(particle.theta) - cos(theta_new));
+    const double theta_new = particle.theta + delta_t * yaw_rate;
 
-    double x_noise = x_dist(gen);
-    double y_noise = y_dist(gen);
-    double theta_noise = theta_dist(gen);
+    double x_new, y_new;
+    if (fabs(yaw_rate) > 0.00001) {
+      const double k = velocity / yaw_rate;
+      x_new = particle.x + k * (sin(theta_new) - sin(particle.theta));
+      y_new = particle.y + k * (cos(particle.theta) - cos(theta_new));
+    } else {
+      x_new = particle.x + velocity * delta_t * cos(particle.theta);
+      y_new = particle.y + velocity * delta_t * sin(particle.theta);
+    }
+
+    const double x_noise = x_dist(gen);
+    const double y_noise = y_dist(gen);
+    const double theta_noise = theta_dist(gen);
 
     particle.x = x_new + x_noise;
     particle.y = y_new + y_noise;
@@ -128,64 +131,67 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
   //   (look at equation 3.33 http://planning.cs.uiuc.edu/node99.html)
 
   for (auto& particle : particles) {
-    std::vector<LandmarkObs> predicted_observations;
-
+    std::vector<Map::single_landmark_s> possible_landmarks;
     for (auto& lmark : map_landmarks.landmark_list) {
       const double distance =
           dist(lmark.x_f, lmark.y_f, particle.x, particle.y);
-
       if (distance <= sensor_range) {
-        const Point pt =
-            ConvertGlobalToLocal(Point(lmark.x_f, lmark.y_f),
-                                 Point(particle.x, particle.y), particle.theta);
-        predicted_observations.push_back(LandmarkObs{lmark.id, pt.x, pt.y});
+        possible_landmarks.push_back(lmark);
       }
     }
 
-    std::vector<LandmarkObs> associated_observations;
-    std::vector<LandmarkObs> associated_predictions;
+    std::vector<int> associations;
+    std::vector<double> sense_x;
+    std::vector<double> sense_y;
+    std::vector<double> lmark_x;
+    std::vector<double> lmark_y;
 
-    for (const auto& actual : observations) {
-      double min_so_far = std::numeric_limits<double>::max();
-      size_t found_idx = 0;
+    for (const auto& obs : observations) {
+      const Point obs_on_map = LocalToGlobal(Point{obs.x, obs.y}, particle);
+
+      double best_distance = std::numeric_limits<double>::max();
       bool found = false;
-      for (size_t i = 0; i < predicted_observations.size(); ++i) {
-        const auto& candiate = predicted_observations[i];
-        double distance = dist(candidate.x, candidate.y, actual.x, actual.y);
-        if (distance < min_so_far) {
-          found_idx = i;
+      size_t best_idx = 0;
+      for (size_t i = 0; i < possible_landmarks.size(); ++i) {
+        double d = dist(obs_on_map.x, obs_on_map.y, possible_landmarks[i].x_f,
+                        possible_landmarks[i].y_f);
+        if (!found || (d < best_distance)) {
           found = true;
-          min_so_far = distance;
+          best_distance = d;
+          best_idx = i;
         }
       }
 
-      // TODO(dukexar): Could have several landmarks associated with same
-      // observation? Seems wrong.
-
       if (found) {
-        associated_observations.push_back(LandmarkObs{
-            predicted_observations[found_idx].id, actual.x, actual.y});
-        associated_predictions.push_back(predicted_observations[found_idx]);
+        const auto& lmark = possible_landmarks[best_idx];
+        associations.push_back(lmark.id_i);
+        sense_x.push_back(obs_on_map.x);
+        sense_y.push_back(obs_on_map.y);
+        lmark_x.push_back(lmark.x_f);
+        lmark_y.push_back(lmark.y_f);
+        possible_landmarks.erase(possible_landmarks.begin() + best_idx);
       }
     }
 
-    double weight = 1;
-    for (size_t i = 0; i < associated.size(); ++i) {
-      double x_delta =
-          associated_observations[i].x - associated_predictions[i].x;
-      double y_delta =
-          associated_observations[i].y - associated_predictions[i].y;
+    double weight = 1.0;
+
+    for (size_t i = 0; i < associations.size(); ++i) {
+      const double x_delta = lmark_x[i] - sense_x[i];
+      const double y_delta = lmark_y[i] - sense_y[i];
+
+      const double kx =
+          (x_delta * x_delta) / (std_landmark[0] * std_landmark[0]);
+      const double ky =
+          (y_delta * y_delta) / (std_landmark[1] * std_landmark[1]);
+      const double pdf = exp(-0.5 * (kx + ky)) /
+                         (2 * M_PI * std_landmark[0] * std_landmark[1]);
+      weight *= pdf;
     }
 
-    particle.associations.clear();
-    particle.sense_x.clear();
-    particle.sense_y.clear();
-
-    for (const auto& assoc : associated) {
-      particle.associations.push_back(assoc.id);
-      particle.sense_x.push_back(assoc.x);
-      particle.sense_y.push_back(assoc.y);
-    }
+    particle.weight = weight;
+    particle.associations = associations;
+    particle.sense_x = sense_x;
+    particle.sense_y = sense_y;
   }
 }
 
@@ -194,6 +200,20 @@ void ParticleFilter::resample() {
   // their weight.
   // NOTE: You may find std::discrete_distribution helpful here.
   //   http://en.cppreference.com/w/cpp/numeric/random/discrete_distribution
+
+  std::vector<double> weights;
+  for (const auto& p : particles) {
+    weights.push_back(p.weight);
+  }
+
+  std::discrete_distribution<> dd(begin(weights), end(weights));
+  std::default_random_engine gen;
+
+  std::vector<Particle> new_particles;
+  for (size_t i = 0; i < particles.size(); ++i) {
+    new_particles.push_back(particles[dd(gen)]);
+  }
+  particles = new_particles;
 }
 
 Particle ParticleFilter::SetAssociations(Particle particle,
